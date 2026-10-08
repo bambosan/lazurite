@@ -1,4 +1,5 @@
 from lazurite.material.stage import ShaderStage
+from .compiler_type import CompilerType
 
 
 class ShaderFileOverwrite:
@@ -9,13 +10,23 @@ class ShaderFileOverwrite:
     unknown: str
     varying: str
 
-    def __init__(self) -> None:
+    def __init__(self, compiler_type: CompilerType = CompilerType.SHADERC) -> None:
         self.entry_point = ""
+        self.set_compiler_defaults(compiler_type)
+
+    def set_compiler_defaults(self, compiler_type: CompilerType):
         self.fragment = "shaders/fragment.sc"
         self.vertex = "shaders/vertex.sc"
         self.compute = "shaders/compute.sc"
         self.unknown = "shaders/unknown.sc"
         self.varying = "shaders/varying.def.sc"
+
+        if compiler_type is CompilerType.ALBITE:
+            self.fragment = "shaders/shader.frag"
+            self.vertex = "shaders/shader.vert"
+            self.compute = "shaders/shader.comp"
+            self.unknown = ""
+            self.varying = ""
 
     def read_json(self, json_data: dict):
         self.entry_point = json_data.get("entry_point", self.entry_point)

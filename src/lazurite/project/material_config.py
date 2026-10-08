@@ -19,7 +19,7 @@ class MaterialConfig:
         self.compiler_options = []
         self.macro_overwrite_pass = {}
         self.macro_overwrite_flags = {}
-        self.file_overwrite_default = ShaderFileOverwrite()
+        self.file_overwrite_default = ShaderFileOverwrite(self.compiler_type)
         self.file_overwrite_pass = {}
         self.supported_platforms = set(ShaderPlatform)
 
@@ -39,6 +39,7 @@ class MaterialConfig:
             CompilerType.from_name(compiler_config.get("type", ""))
             or self.compiler_type
         )
+        self.file_overwrite_default.set_compiler_defaults(self.compiler_type)
         self.compiler_options = compiler_config.get("options", self.compiler_options)
 
         # Macro overwrite

@@ -203,6 +203,8 @@ def build(args):
             args.max_workers or None,
             not args.skip_validation,
             args.glslang,
+            args.albite,
+            args.albite_args,
         )
 
 
@@ -462,6 +464,7 @@ def main():
         "--shaderc", type=str, default=None, help="SHADERC compiler command"
     )
     group.add_argument("--dxc", type=str, default=None, help="DXC compiler command")
+    group.add_argument("--albite", type=str, default=None, help="ALBITE compiler command")
     group.add_argument(
         "--shaderc-args",
         type=str,
@@ -475,6 +478,13 @@ def main():
         nargs="*",
         default=[],
         help="Additional DXC compiler arguments",
+    )
+    group.add_argument(
+        "--albite-args",
+        type=str,
+        nargs="*",
+        default=[],
+        help="Additional ALBITE compiler arguments",
     )
     group.add_argument(
         "--skip-validation",

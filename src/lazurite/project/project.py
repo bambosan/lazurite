@@ -15,6 +15,8 @@ from lazurite import util
 from lazurite.material import Material
 from lazurite.material.shader_pass.shader_definition import ShaderPlatform
 from lazurite.material.stage import ShaderStage
+from lazurite.compiler.albite import AlbiteCompiler
+from lazurite.compiler.albite_container import validate_link
 from lazurite.compiler.shaderc import ShadercCompiler, generate_bgfx_defines
 from lazurite.compiler.dxc import DxcCompiler
 from lazurite.compiler.macro_define import MacroDefine
@@ -144,7 +146,7 @@ def _generate_defines(
     variant: Variant,
 ):
     defines = config.macros[:]
-    if mat_config.compiler_type is CompilerType.SHADERC:
+    if mat_config.compiler_type in (CompilerType.SHADERC, CompilerType.ALBITE):
         defines.append(MacroDefine("BGFX_CONFIG_MAX_BONES", 4))
 
     # TODO: remove `s_`, so that SSBOs in restored vanilla code can work right away.
@@ -167,6 +169,25 @@ def _generate_defines(
             defines.append(MacroDefine(util.generate_flag_name_macro(key, value)))
 
     return defines
+
+
+def _compile_albite_shader_async(
+    albite_compiler: AlbiteCompiler,
+    code_path: str,
+    stage: ShaderStage,
+    platform: ShaderPlatform,
+    include: list[str],
+    defines: list[MacroDefine],
+    options: list[str],
+):
+    return albite_compiler.compile(
+        code_path,
+        platform,
+        stage,
+        include,
+        defines,
+        options,
+    )
 
 
 def _compile_bgfx_shader_async(
@@ -281,6 +302,8 @@ def compile(
     max_workers: int = None,
     validate: bool = True,
     glslang_path: str = None,
+    albite_path: str = None,
+    albite_args: list[str] | None = None,
 ):
     if not os.path.isdir(project_path):
         raise Exception(f'Failed to compile project: "{project_path}" is not a folder.')
@@ -291,6 +314,8 @@ def compile(
         shaderc_args = []
     if dxc_args is None:
         dxc_args = []
+    if albite_args is None:
+        albite_args = []
     if material_patterns is None:
         material_patterns = []
     if exclude_material_patterns is None:
@@ -312,6 +337,7 @@ def compile(
 
     shaderc_compiler: ShadercCompiler | None = None
     dxc_compiler: DxcCompiler | None = None
+    albite_compiler: AlbiteCompiler | None = None
     opengl_context: "moderngl.Context" | None = None
     glslang: Glslang | None = None
 
@@ -328,6 +354,7 @@ def compile(
 
     for mat_dir in _get_material_folders(proj_config, project_path):
         shaders: list[ShaderDefinition] = []
+        arg_owner: list[tuple[Pass, Variant]] = []
         arg_defines: list[list[MacroDefine]] = []
         arg_code_path: list[str] = []
         arg_stage: list[ShaderStage] = []
@@ -339,6 +366,16 @@ def compile(
 
         mat_config = MaterialConfig()
         mat_config.read_from_json_file(os.path.join(mat_dir, "config.json"))
+
+        if mat_config.compiler_type is CompilerType.SHADERC:
+            if shaderc_compiler is None:
+                shaderc_compiler = ShadercCompiler(shaderc_path)
+        elif mat_config.compiler_type is CompilerType.DXC:
+            if dxc_compiler is None:
+                dxc_compiler = DxcCompiler(dxc_path)
+        elif mat_config.compiler_type is CompilerType.ALBITE:
+            if albite_compiler is None:
+                albite_compiler = AlbiteCompiler(albite_path)
 
         # Target platforms AND platforms supported by material.
         compilable_platforms = project_platforms.intersection(
@@ -393,8 +430,6 @@ def compile(
 
                     if mat_config.compiler_type is CompilerType.SHADERC:
                         varying_path = None
-                        if shaderc_compiler is None:
-                            shaderc_compiler = ShadercCompiler(shaderc_path)
                         if shader.stage is not ShaderStage.Compute:
                             varying_path = os.path.normpath(
                                 os.path.join(mat_dir, file_overwrite.varying)
@@ -405,14 +440,12 @@ def compile(
                                 )
                                 continue
                         arg_varying.append(varying_path)
-                    else:
-                        if dxc_compiler is None:
-                            dxc_compiler = DxcCompiler(dxc_path)
+                    elif mat_config.compiler_type is CompilerType.DXC:
                         arg_entry_point.append(
                             file_overwrite.entry_point or shader_pass.name
                         )
-
                     shaders.append(shader)
+                    arg_owner.append((shader_pass, variant))
                     arg_code_path.append(code_path)
                     arg_stage.append(shader.stage)
                     arg_platform.append(shader.platform)
@@ -437,7 +470,7 @@ def compile(
                     len(shaders) * [mat_config.compiler_options + shaderc_args],
                     len(shaders) * [glslang],
                 )
-            else:
+            elif mat_config.compiler_type is CompilerType.DXC:
                 results = executor.map(
                     dxc_compiler.compile,
                     arg_code_path,
@@ -448,13 +481,42 @@ def compile(
                     arg_defines,
                     len(shaders) * [mat_config.compiler_options + dxc_args],
                 )
+            else:
+                results = executor.map(
+                    _compile_albite_shader_async,
+                    len(shaders) * [albite_compiler],
+                    arg_code_path,
+                    arg_stage,
+                    arg_platform,
+                    len(shaders) * [proj_config.include_search_paths],
+                    arg_defines,
+                    len(shaders) * [mat_config.compiler_options + albite_args],
+                )
+
+        # Albite results by (variant, platform), to check that stages link.
+        link_groups: dict = {}
 
         for i, (shader, result) in enumerate(zip(shaders, results)):
-            if mat_config.compiler_type is CompilerType.SHADERC:
-                shader.bgfx_shader = result
+            if mat_config.compiler_type in (CompilerType.SHADERC, CompilerType.ALBITE):
+                if mat_config.compiler_type is CompilerType.ALBITE:
+                    # Albite has no varying.def.sc, the shader itself is the source
+                    # of truth for its inputs (attributes / varyings) and semantics.
+                    shader.bgfx_shader = result.bgfx_shader
+                    shader.inputs = result.inputs
 
-                if moderngl_validate and shader.platform.name.startswith(
-                    ("GLSL", "ESSL")
+                    shader_pass, variant = arg_owner[i]
+                    group = link_groups.setdefault(
+                        (id(variant), shader.platform),
+                        (shader_pass, variant, shader.platform, {}),
+                    )
+                    group[3][shader.stage] = result.io
+                else:
+                    shader.bgfx_shader = result
+
+                if (
+                    mat_config.compiler_type is CompilerType.SHADERC
+                    and moderngl_validate
+                    and shader.platform.name.startswith(("GLSL", "ESSL"))
                 ):
                     if opengl_context is None:
                         opengl_context = moderngl.create_context(standalone=True)
@@ -463,6 +525,23 @@ def compile(
 
             else:
                 shader.bgfx_shader.shader_bytes = result
+
+        link_problems = []
+        for shader_pass, variant, platform, stages in link_groups.values():
+            if ShaderStage.Vertex in stages and ShaderStage.Fragment in stages:
+                flags = ", ".join(f"{k}={v}" for k, v in variant.flags.items())
+                where = (
+                    f"{mat_dir.name} / {shader_pass.name} / {platform.name} / "
+                    f"{flags or 'no variant flags'}"
+                )
+                for problem in validate_link(
+                    stages[ShaderStage.Vertex], stages[ShaderStage.Fragment]
+                ):
+                    link_problems.append(f"[{where}] {problem}")
+        if link_problems:
+            raise Exception(
+                "Vertex and fragment shaders don't link:\n" + "\n".join(link_problems)
+            )
 
         # Filter empty shaders.
         for shader_pass in material.passes:
